@@ -1,0 +1,12 @@
+[package]
+name = "fcp"
+version = "0.0.1"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+rayon = "1.5.1"
+clap = { version = "3.0.14", features = ["derive"] }
+crossbeam = "0.8.1"
+indicatif = {version = "0.16.2", features = ["rayon"]}

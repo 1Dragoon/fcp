@@ -8,5 +8,4 @@ edition = "2021"
 [dependencies]
 rayon = "1.5.1"
 clap = { version = "3.0.14", features = ["derive"] }
-crossbeam = "0.8.1"
 indicatif = "0.16.2"

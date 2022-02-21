@@ -49,7 +49,7 @@ fn copy<U: AsRef<Path>, V: AsRef<Path>>(from: &U, to: &V) {
     let received: (Vec<_>, Vec<_>) = rx.into_iter().unzip();
     let (file_set, sizes) = received;
     let file_count = file_set.len();
-    let total_size = sizes.into_iter().fold(0, |acc, f| acc + f);
+    let total_size = sizes.into_iter().sum();
 
     let pb = ProgressBar::new(total_size);
     pb.set_style(
@@ -66,40 +66,58 @@ fn copy<U: AsRef<Path>, V: AsRef<Path>>(from: &U, to: &V) {
     let output = process_files(&pb, &source, &dest, file_set, sender).1;
     let err_out: (Vec<_>, Vec<_>) = output.into_iter().unzip();
     let (err_set, _) = err_out;
-    let sender = tx.clone();
-    let perm_failed = process_files(&pb, &source, &dest, err_set, sender).1;
-    let total_copied = rx.iter().count();
-    // let copied_data = rx.into_iter().fold(0, |acc, x| acc + x);
-    
+    let perm_failed = process_files(&pb, &source, &dest, err_set, tx).1;
+    let sizes = rx.iter().collect::<Vec<_>>();
+    let copied_data = sizes.iter().sum();
+
     pb.finish_at_current_pos();
 
-    perm_failed.into_iter().map(|f| f.1).for_each(|f| println!("{}", f));
+    if !perm_failed.is_empty() {
+        perm_failed
+        .into_iter()
+        .map(|f| f.1)
+        .for_each(|f| println!("{}", f));
     println!(
-        "Copied {total_copied} files of {file_count}, {} in {}",
+        "Copied {} files of {}, {} of {} in {}",
+        sizes.len(),
+        file_count,
+        HumanBytes(copied_data),
         HumanBytes(total_size),
         FormattedDuration(start.elapsed())
     );
+    } else {
+        println!(
+            "Copied {} files, {} in {}",
+            file_count,
+            HumanBytes(total_size),
+            FormattedDuration(start.elapsed())
+        );
+    }
 }
 
-fn process_files(
+type DirEntryResult = Result<DirEntry, std::io::Error>;
+
+fn process_files<U: AsRef<Path> + Sync, V: AsRef<Path> + Sync>(
     pb: &ProgressBar,
-    source: &PathBuf,
-    dest: &PathBuf,
-    files: Vec<Result<DirEntry, std::io::Error>>,
-    tx: Sender<u64>
-) -> (Vec<Result<DirEntry, std::io::Error>>, Vec<(Result<DirEntry, std::io::Error>, String)>) {
+    source: &U,
+    dest: &V,
+    files: Vec<DirEntryResult>,
+    tx: Sender<u64>,
+) -> (
+    Vec<DirEntryResult>, Vec<(DirEntryResult, String)>,
+) {
     // Won't ever get used, but it makes the compiler happy
     let default = PathBuf::from(".");
 
     files
-        .into_par_iter().map_with(tx, |s, x| (s.clone(), x))
-        .partition_map(|f: (Sender<u64>, Result<DirEntry, std::io::Error>)| {
+        .into_par_iter()
+        .map_with(tx, |s, x| (s.clone(), x))
+        .partition_map(|f: (Sender<u64>, DirEntryResult)| {
             let (tx, file) = f;
             let entry = match file {
                 Ok(ref ok) => ok,
                 Err(ref err) => {
                     let err_message = format!("Error: {:?}", err.kind());
-                    std::mem::drop(tx);
                     return Either::Right((file, err_message));
                 }
             };
@@ -110,14 +128,13 @@ fn process_files(
                 Err(ref err) => {
                     let err_message = format!(
                         "Strip Prefix Error: {} for file {}",
-                        err.to_string(),
+                        err,
                         entry.path().as_os_str().to_string_lossy()
                     );
-                    std::mem::drop(tx);
                     return Either::Right((file, err_message));
                 }
             };
-            let dpath = dest.join(&stem);
+            let dpath = dest.as_ref().join(&stem);
             let size = match entry.metadata() {
                 Ok(ok) => ok,
                 Err(ref err) => {
@@ -126,7 +143,6 @@ fn process_files(
                         err.kind(),
                         entry.path().as_os_str().to_string_lossy()
                     );
-                    std::mem::drop(tx);
                     return Either::Right((file, err_message));
                 }
             }
@@ -139,10 +155,37 @@ fn process_files(
                         err.kind(),
                         entry.path().as_os_str().to_string_lossy()
                     );
-                    std::mem::drop(tx);
                     return Either::Right((file, err_message));
                 }
             };
+            if dpath.exists() {
+                let d_metadata = match dpath.metadata() {
+                    Ok(ok) => ok,
+                    Err(ref err) => {
+                        let err_message = format!(
+                            "Metadata Fetch Error: {:?} for file {}",
+                            err.kind(),
+                            entry.path().as_os_str().to_string_lossy()
+                        );
+                        return Either::Right((file, err_message));
+                    }
+                };
+                let mut permissions = d_metadata.permissions();
+                if permissions.readonly() {
+                    permissions.set_readonly(false);
+                    match std::fs::set_permissions(&dpath, permissions) {
+                        Ok(_) => {}
+                        Err(ref err) => {
+                            let err_message = format!(
+                                "Error unsetting readonly: {:?} for file {}",
+                                err.kind(),
+                                entry.path().as_os_str().to_string_lossy()
+                            );
+                            return Either::Right((file, err_message));
+                        }
+                    }
+                }
+            }
             match fs::copy(&spath, &dpath) {
                 Ok(_) => {}
                 Err(ref err) => {
@@ -163,7 +206,7 @@ fn process_files(
 
 fn scan<'a, U: AsRef<Path>>(
     src: &U,
-    tx: Sender<(Result<DirEntry, std::io::Error>, u64)>,
+    tx: Sender<(DirEntryResult, u64)>,
     scope: &Scope<'a>,
 ) {
     let dir = fs::read_dir(src).unwrap();

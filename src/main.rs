@@ -2,6 +2,7 @@ use clap::Parser;
 use indicatif::{FormattedDuration, HumanBytes, ProgressBar, ProgressStyle};
 use rayon::iter::{Either, IntoParallelIterator, ParallelIterator};
 use rayon::Scope;
+use std::collections::HashMap;
 use std::fs::{self, DirEntry};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
@@ -97,6 +98,18 @@ fn copy<U: AsRef<Path>, V: AsRef<Path>>(from: &U, to: &V) {
 
 type DirEntryResult = Result<DirEntry, std::io::Error>;
 
+macro_rules! distribute_output {
+    ($dothis:expr, $file:expr, $msg:expr, $err:ident) => {
+        match $dothis {
+            Ok(ref ok) => ok,
+            Err(ref $err) => {
+                let message = $msg;
+                return Either::Right(($file, message));
+            }
+        }
+    };
+}
+
 fn process_files<U: AsRef<Path> + Sync, V: AsRef<Path> + Sync>(
     pb: &ProgressBar,
     source: &U,
@@ -114,89 +127,31 @@ fn process_files<U: AsRef<Path> + Sync, V: AsRef<Path> + Sync>(
         .map_with(tx, |s, x| (s.clone(), x))
         .partition_map(|f: (Sender<u64>, DirEntryResult)| {
             let (tx, file) = f;
-            let entry = match file {
-                Ok(ref ok) => ok,
-                Err(ref err) => {
-                    let err_message = format!("Error: {:?}", err.kind());
-                    return Either::Right((file, err_message));
-                }
-            };
+            macro_rules! handleit { ($dothis:expr, $err:ident, $msg:expr) => {distribute_output!($dothis, file, $msg, $err) } }
+            let entry = handleit!(file, err, format!("Error: {:?}", err.kind()));
+            macro_rules! ioerr {
+                ($step:expr, $err:expr) => {
+                    format!("{}: {:?} for file {}", $step, $err, entry.path().as_os_str().to_string_lossy().into_owned())
+                };
+            }
+            
             let spath = entry.path();
             pb.set_message(format!("{}", spath.display()));
-            let stem = match spath.strip_prefix(&source) {
-                Ok(ok) => ok,
-                Err(ref err) => {
-                    let err_message = format!(
-                        "Strip Prefix Error: {} for file {}",
-                        err,
-                        entry.path().as_os_str().to_string_lossy()
-                    );
-                    return Either::Right((file, err_message));
-                }
-            };
+            let strip = spath.strip_prefix(&source);
+            let stem = handleit!(strip, err, ioerr!("Strip Prefix Error", err));
             let dpath = dest.as_ref().join(&stem);
-            let size = match entry.metadata() {
-                Ok(ok) => ok,
-                Err(ref err) => {
-                    let err_message = format!(
-                        "Metadata Fetch Error: {:?} for file {}",
-                        err.kind(),
-                        entry.path().as_os_str().to_string_lossy()
-                    );
-                    return Either::Right((file, err_message));
-                }
-            }
-            .len();
-            match fs::create_dir_all(&dpath.parent().unwrap_or_else(|| default.as_path())) {
-                Ok(_) => {}
-                Err(ref err) => {
-                    let err_message = format!(
-                        "Directory Create Error: {:?} for file {}",
-                        err.kind(),
-                        entry.path().as_os_str().to_string_lossy()
-                    );
-                    return Either::Right((file, err_message));
-                }
-            };
+            let size = handleit!(entry.metadata(), err, ioerr!("Metadata Fetch Error {}", err.kind())).len();
+            handleit!(fs::create_dir_all(&dpath.parent().unwrap_or_else(|| default.as_path())), err, ioerr!("Directory Create Error", err.kind()));
             if dpath.exists() {
-                let d_metadata = match dpath.metadata() {
-                    Ok(ok) => ok,
-                    Err(ref err) => {
-                        let err_message = format!(
-                            "Metadata Fetch Error: {:?} for file {}",
-                            err.kind(),
-                            entry.path().as_os_str().to_string_lossy()
-                        );
-                        return Either::Right((file, err_message));
-                    }
-                };
+                let dmd = dpath.metadata();
+                let d_metadata = handleit!(dmd, err, ioerr!("Metadata Fetch Error", err.kind()));
                 let mut permissions = d_metadata.permissions();
                 if permissions.readonly() {
                     permissions.set_readonly(false);
-                    match std::fs::set_permissions(&dpath, permissions) {
-                        Ok(_) => {}
-                        Err(ref err) => {
-                            let err_message = format!(
-                                "Error unsetting readonly: {:?} for file {}",
-                                err.kind(),
-                                entry.path().as_os_str().to_string_lossy()
-                            );
-                            return Either::Right((file, err_message));
-                        }
-                    }
+                    handleit!(fs::set_permissions(&dpath, permissions), err, ioerr!("Error unsetting readonly", err.kind()));
                 }
             }
-            match fs::copy(&spath, &dpath) {
-                Ok(_) => {}
-                Err(ref err) => {
-                    let err_message = format!(
-                        "Error while copying: {:?} for file {}",
-                        err.kind(),
-                        entry.path().as_os_str().to_string_lossy()
-                    );
-                    return Either::Right((file, err_message));
-                }
-            };
+            handleit!(fs::copy(&spath, &dpath), err, ioerr!("Error while copying", err.kind()));
             tx.send(size).unwrap();
             pb.inc(size);
             Either::Left(file)

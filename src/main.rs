@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 
 #[derive(Debug, Parser)]
-#[clap(name = "mtcopy", about = "Multi-threaded copy...in rust!")]
+#[clap(name = "fcp", about = "Multi-threaded copy...in rust!")]
 struct Opt {
     /// Source directory
     source: String,
@@ -194,7 +194,6 @@ fn process_files<U: AsRef<Path> + Sync, V: AsRef<Path> + Sync>(
                         err.kind(),
                         entry.path().as_os_str().to_string_lossy()
                     );
-                    std::mem::drop(tx);
                     return Either::Right((file, err_message));
                 }
             };

@@ -11,6 +11,7 @@ use std::sync::mpsc::{self, Sender};
 use std::{io, ptr};
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Storage::FileSystem;
+use windows_sys::Win32::System::WindowsProgramming::*;
 
 #[derive(Debug, Parser)]
 #[clap(name = "fcp", about = "Multi-threaded copy...in rust!")]
@@ -20,6 +21,9 @@ struct Opt {
 
     /// Destination directory
     dest: String,
+
+    // / Allow copying from encrypted location to unencrypted location
+    // allow_efs_to_nonefs: bool;
 }
 
 fn unrolled_find_u16s(needle: u16, haystack: &[u16]) -> Option<usize> {
@@ -302,7 +306,7 @@ fn win_copy<U: AsRef<Path>, V: AsRef<Path>>(
             Some(callback),
             ptr::addr_of_mut!(func) as *mut c_void,
             ptr::null_mut(),
-            0,
+            0 //COPY_FILE_REQUEST_COMPRESSED_TRAFFIC,
         )
     };
     if boolresult != 0 {

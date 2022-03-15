@@ -7,8 +7,11 @@ use std::fs::{self, DirEntry};
 use std::io::{Error, ErrorKind};
 use std::os::windows::prelude::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::{io, ptr};
+use std::sync::Arc;
+use std::time::Duration;
+use std::{io, ptr, thread};
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Storage::FileSystem;
 use windows_sys::Win32::System::WindowsProgramming::*;
@@ -21,7 +24,6 @@ struct Opt {
 
     /// Destination directory
     dest: String,
-
     // / Allow copying from encrypted location to unencrypted location
     // allow_efs_to_nonefs: bool;
 }
@@ -98,33 +100,93 @@ fn copy<U: AsRef<Path>, V: AsRef<Path>>(from: &U, to: &V) {
     let source = PathBuf::from(from.as_ref());
     let dest = PathBuf::from(to.as_ref());
 
-    let (tx, rx) = mpsc::channel();
-    rayon::scope(|s| scan(&source, tx, s));
-    let received: (Vec<_>, Vec<_>) = rx.into_iter().unzip();
-    let (file_set, sizes) = received;
-    let file_count = file_set.len();
-    let total_size = sizes.into_iter().sum();
-
-    let pb = ProgressBar::new(total_size);
+    let pb = ProgressBar::new(0);
     pb.set_style(
         ProgressStyle::default_bar()
             .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:50.cyan/blue}] {bytes}/{total_bytes} ({eta})",
+                "{spinner:.green} [{elapsed_precise}] [{bar:50.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec} ({eta}) [{wide_msg}]",
             )
             .progress_chars("#>-")
             // .on_finish(finish)
     );
 
-    let (tx, rx) = mpsc::channel();
-    let sender = tx.clone();
-    let output = process_files(&pb, &source, &dest, file_set, sender).1;
-    let err_out: (Vec<_>, Vec<_>) = output.into_iter().unzip();
-    let (err_set, _) = err_out;
-    let perm_failed = process_files(&pb, &source, &dest, err_set, tx).1;
-    let sizes = rx.iter().collect::<Vec<_>>();
+    let (failed_tx, failed_rx) = mpsc::channel();
+    let (size_tx, size_rx) = mpsc::channel();
+    let file_count = Arc::new(AtomicUsize::new(0));
+    let total_size = AtomicU64::new(0);
+
+    {
+        let (scan_tx, scan_rx) = mpsc::channel();
+        let scan_finished = Arc::new(AtomicBool::new(false));
+        {
+            let sf = scan_finished.clone();
+            let src = source.clone();
+            let scan_pb = pb.clone();
+            thread::spawn(move || {
+                rayon::scope(|s| scan(scan_pb, &src, scan_tx, s));
+                sf.store(true, Ordering::Relaxed);
+            });
+        }
+
+        let (err_tx, err_rx) = mpsc::channel();
+
+        let copy_finished = Arc::new(AtomicBool::new(false));
+        {
+            let sztx = size_tx.clone();
+            let cp_fin = copy_finished.clone();
+            let cp_pb = pb.clone();
+            let cp_fc = file_count.clone();
+            let cp_src = source.clone();
+            let cp_dst = dest.clone();
+            thread::spawn(move || {
+                loop {
+                    let done = scan_finished.load(Ordering::Relaxed);
+                    thread::sleep(Duration::new(0, 100_000_000)); // Sleep 100ms to give the CPU a coffee break
+                    let received: (Vec<_>, Vec<_>) = scan_rx.try_recv().into_iter().unzip();
+                    let (file_set, _sizes) = received;
+                    if !file_set.is_empty() {
+                        cp_fc.fetch_add(file_set.len(), Ordering::Relaxed);
+                        let output =
+                            process_files(&cp_pb, &cp_src, &cp_dst, file_set, sztx.clone());
+                        err_tx.send(output).unwrap();
+                    }
+                    if done {
+                        break;
+                    }
+                }
+                cp_fin.store(true, Ordering::Relaxed);
+            });
+        }
+
+        {
+            let err_pb = pb.clone();
+            thread::spawn(move || {
+                loop {
+                    let done = copy_finished.load(Ordering::Relaxed);
+                    thread::sleep(Duration::new(0, 100_000_000)); // Sleep 100ms to give the CPU a coffee break
+                    let err_out: (Vec<_>, Vec<_>) = err_rx.try_recv().into_iter().unzip();
+                    let (err_set, _) = err_out;
+                    if !err_set.is_empty() {
+                        
+                        let err_set = err_set.into_iter().flatten().collect::<Vec<_>>();
+                        let perm_failed =
+                            process_files(&err_pb, &source, &dest, err_set, size_tx.clone()).1;
+                        failed_tx.send(perm_failed).unwrap();
+                    }
+                    if done {
+                        break;
+                    }
+                }
+            });
+        }
+    }
+
+    let sizes = size_rx.iter().collect::<Vec<_>>(); // We effectively block here.
     let copied_data = sizes.iter().sum();
 
     pb.finish_at_current_pos();
+
+    let perm_failed = failed_rx.recv().into_iter().flatten().collect::<Vec<_>>();
 
     if !perm_failed.is_empty() {
         perm_failed
@@ -134,16 +196,16 @@ fn copy<U: AsRef<Path>, V: AsRef<Path>>(from: &U, to: &V) {
         println!(
             "Copied {} files of {}, {} of {} in {}",
             sizes.len(),
-            file_count,
+            file_count.load(Ordering::Relaxed),
             HumanBytes(copied_data),
-            HumanBytes(total_size),
+            HumanBytes(total_size.load(Ordering::Relaxed)),
             FormattedDuration(start.elapsed())
         );
     } else {
         println!(
             "Copied {} files, {} in {}",
-            file_count,
-            HumanBytes(total_size),
+            file_count.load(Ordering::Relaxed),
+            HumanBytes(total_size.load(Ordering::Relaxed)),
             FormattedDuration(start.elapsed())
         );
     }
@@ -197,7 +259,10 @@ fn process_files<U: AsRef<Path> + Sync, V: AsRef<Path> + Sync>(
             }
 
             let spath = entry.path();
-            pb.set_message(format!("{}", spath.display()));
+            let s = spath.display().to_string();
+            if let Some((i, _)) = s.char_indices().rev().nth(50) {
+                pb.set_message(s[i..].to_owned());
+            }
             let strip = spath.strip_prefix(&source);
             let stem = handleit!(strip, err, ioerr!("Strip Prefix Error", err, ""));
             let dpath = dest.as_ref().join(&stem);
@@ -243,7 +308,7 @@ fn process_files<U: AsRef<Path> + Sync, V: AsRef<Path> + Sync>(
             }
 
             #[cfg(target_os = "windows")]
-            handleit!(
+            let copied = *handleit!(
                 win_copy(&spath, &dpath, pb),
                 err,
                 ioerr!(
@@ -258,11 +323,18 @@ fn process_files<U: AsRef<Path> + Sync, V: AsRef<Path> + Sync>(
                 handleit!(
                     fs::copy(&spath, &dpath),
                     err,
-                    ioerr!("Error while copying", err.kind(), err.raw_os_error().unwrap_or_default())
+                    ioerr!(
+                        "Error while copying",
+                        err.kind(),
+                        err.raw_os_error().unwrap_or_default()
+                    )
                 );
                 pb.inc(size);
             }
 
+            if copied != size {
+                println!("Liar!")
+            }
             tx.send(size).unwrap();
             Either::Left(file)
         })
@@ -272,7 +344,7 @@ fn win_copy<U: AsRef<Path>, V: AsRef<Path>>(
     spath: U,
     dpath: V,
     pb: &ProgressBar,
-) -> io::Result<()> {
+) -> io::Result<u64> {
     let pfrom = to_u16s(spath.as_ref()).unwrap();
     let pto = to_u16s(dpath.as_ref()).unwrap();
     #[allow(non_snake_case)]
@@ -292,10 +364,12 @@ fn win_copy<U: AsRef<Path>, V: AsRef<Path>>(
         (*prog_data)(TotalBytesTransferred as _);
         0
     }
-    let mut last_transferred = 0u64;
+    let mut last_transferred = 0;
+    let mut total_transferred = 0;
     let mut inc_pb = |just_transferred: u64| {
         pb.inc(just_transferred - last_transferred);
         last_transferred = just_transferred;
+        total_transferred += just_transferred - last_transferred;
     };
     let mut func = &mut inc_pb as &mut dyn FnMut(u64);
     let boolresult = unsafe {
@@ -306,19 +380,23 @@ fn win_copy<U: AsRef<Path>, V: AsRef<Path>>(
             Some(callback),
             ptr::addr_of_mut!(func) as *mut c_void,
             ptr::null_mut(),
-            0 //COPY_FILE_REQUEST_COMPRESSED_TRAFFIC,
+            COPY_FILE_REQUEST_COMPRESSED_TRAFFIC,
         )
     };
     if boolresult != 0 {
         // nonzero means success according to ms documents https://docs.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-copyfileexw
-        Ok(())
+        Ok(last_transferred)
     } else {
         Err(Error::last_os_error())
     }
-
 }
 
-fn scan<'a, U: AsRef<Path>>(src: &U, tx: Sender<(DirEntryResult, u64)>, scope: &Scope<'a>) {
+fn scan<'a, U: AsRef<Path>>(
+    pb: ProgressBar,
+    src: &U,
+    tx: Sender<(DirEntryResult, u64)>,
+    scope: &Scope<'a>,
+) {
     if src.as_ref().is_dir() {
         let dir = fs::read_dir(src).unwrap();
         dir.into_iter().for_each(|entry| {
@@ -327,10 +405,12 @@ fn scan<'a, U: AsRef<Path>>(src: &U, tx: Sender<(DirEntryResult, u64)>, scope: &
 
             if path.is_dir() {
                 let tx = tx.clone();
-                scope.spawn(move |s| scan(&path, tx, s))
+                let pb = pb.clone();
+                scope.spawn(move |s| scan(pb, &path, tx, s))
             } else {
                 // dbg!("{}", path.as_os_str().to_string_lossy());
                 let size = info.metadata().unwrap().len();
+                pb.inc_length(size);
                 tx.send((entry, size)).unwrap();
             }
         });

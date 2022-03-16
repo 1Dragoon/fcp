@@ -3,7 +3,7 @@ use clap::Parser;
 use indicatif::{FormattedDuration, HumanBytes, ProgressBar, ProgressStyle};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rayon::Scope;
-use shellexpand;
+
 use std::fs::{self, DirEntry, Metadata};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -54,41 +54,10 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn copy_recurse<U: AsRef<Path>, V: AsRef<Path>>(from: &U, to: &V) -> Result<()> {
+fn copy_recurse<U: AsRef<Path>, V: AsRef<Path>>(source: &U, dest: &V) -> Result<()> {
     let start = std::time::Instant::now();
 
-    // let options = MatchOptions {
-    //     case_sensitive: false,
-    //     require_literal_separator: false,
-    //     require_literal_leading_dot: false,
-    // };
-
-    let src_str = from.as_ref().to_str().unwrap(); // FIXME: Handle OsStr differently whenever https://rust-lang.github.io/rfcs/2295-os-str-pattern.html is approved.
-    let source = if is_wildcard_path(src_str) {
-        // glob::glob_with(src_str, options)(|e| {
-        //     expect!("Source used a glob pattern, but the pattern was invalid.");
-        // })
-        bail!("Wildcard source paths are not currently supported.")
-    } else {
-        PathBuf::from(src_str)
-            .dunce_canonicalize()
-            .context("Unable to resolve complete source path.")?
-    };
-
-    let dst_str = to.as_ref().to_str().unwrap(); // FIXME: Handle OsStr differently whenever https://rust-lang.github.io/rfcs/2295-os-str-pattern.html is approved.
-    let dest = if is_wildcard_path(dst_str) {
-        bail!("Wildcard destination paths are not allowed.")
-    } else {
-        let dpath = PathBuf::from(dst_str);
-        fs::create_dir_all(&dpath).context("Unable to resolve complete destination path.")?;
-        dpath
-            .dunce_canonicalize()
-            .context("Unable to resolve complete destination path.")?
-    };
-
-    if source == dest {
-        bail!("Source and destination paths are the same.");
-    }
+    let (source, dest) = normalize_input(source, dest)?;
 
     let pb = ProgressBar::new(0);
     pb.enable_steady_tick(50);
@@ -102,31 +71,76 @@ fn copy_recurse<U: AsRef<Path>, V: AsRef<Path>>(from: &U, to: &V) -> Result<()> 
     );
     // pb.enable_steady_tick(10);
 
+    let state = work(source, &pb, dest);
+
+    let sizes = state
+        .complete_rx
+        .into_iter()
+        .filter_map(|r| r.size)
+        .collect::<Vec<_>>(); // Block here until complete_tx sender is gone
+    let copied_data = sizes.iter().sum();
+
+    let perm_failed = state.failed_rx.into_iter().collect::<Vec<_>>(); // Block here until the err_thread sender is gone
+
+    state.copy_thread.join().unwrap();
+    state.err_thread.join().unwrap();
+    pb.finish_at_current_pos();
+    let _ = pb;
+
+    if !perm_failed.is_empty() {
+        perm_failed
+            .into_iter()
+            .for_each(|f| println!("{:?}", f.error));
+        println!(
+            "Copied {} files of {}, {} of {} in {}",
+            sizes.len(),
+            state.file_count.load(Ordering::Relaxed),
+            HumanBytes(copied_data),
+            HumanBytes(state.total_size.load(Ordering::Relaxed)),
+            FormattedDuration(start.elapsed())
+        );
+    } else {
+        println!(
+            "Copied {} files, {} in {}",
+            state.file_count.load(Ordering::Relaxed),
+            HumanBytes(state.total_size.load(Ordering::Relaxed)),
+            FormattedDuration(start.elapsed())
+        );
+    }
+
+    Ok(())
+}
+
+struct State {
+    failed_rx: mpsc::Receiver<ActionResult>,
+    file_count: Arc<AtomicUsize>,
+    total_size: Arc<AtomicU64>,
+    complete_rx: mpsc::Receiver<ActionResult>,
+    copy_thread: thread::JoinHandle<()>,
+    err_thread: thread::JoinHandle<()>,
+}
+
+fn work(source: PathBuf, pb: &ProgressBar, dest: PathBuf) -> State {
     let (failed_tx, failed_rx) = mpsc::channel();
     let file_count = Arc::new(AtomicUsize::new(0));
     let total_size = Arc::new(AtomicU64::new(0));
     let scan_finished = Arc::new(AtomicBool::new(false));
     let (scan_tx, scan_rx) = mpsc::channel();
-
     let scan_thread = {
-        {
-            let ts = total_size.clone();
-            let sf = scan_finished.clone();
-            let src = source.clone();
-            let scan_pb = pb.clone();
-            thread::spawn(move || {
-                rayon::scope(|s| scan(scan_pb, &src, scan_tx, ts, s));
-                sf.store(true, Ordering::Relaxed);
-            })
-        }
+        let ts = total_size.clone();
+        let sf = scan_finished.clone();
+        let src = source.clone();
+        let scan_pb = pb.clone();
+        thread::spawn(move || {
+            rayon::scope(|s| scan(scan_pb, &src, scan_tx, ts, s));
+            sf.store(true, Ordering::Relaxed);
+        })
     };
-
     let (complete_tx, complete_rx) = mpsc::channel();
     let (error_tx, error_rx) = mpsc::channel();
-
     let copy_finished = Arc::new(AtomicBool::new(false));
     let copy_thread = {
-        let etx = error_tx.clone();
+        let etx = error_tx;
         let ctx = complete_tx.clone();
         let cp_fin = copy_finished.clone();
         let cp_pb = pb.clone();
@@ -163,11 +177,11 @@ fn copy_recurse<U: AsRef<Path>, V: AsRef<Path>>(from: &U, to: &V) -> Result<()> 
             cp_fin.store(true, Ordering::Relaxed);
         })
     };
-
+    // Let the scan finish before we start working on retries
     scan_thread.join().unwrap();
     let err_thread = {
-        let ftx = failed_tx.clone();
-        let ctx = complete_tx.clone();
+        let ftx = failed_tx;
+        let ctx = complete_tx;
         let err_pb = pb.clone();
         thread::spawn(move || {
             loop {
@@ -197,40 +211,50 @@ fn copy_recurse<U: AsRef<Path>, V: AsRef<Path>>(from: &U, to: &V) -> Result<()> 
         })
     };
 
-    copy_thread.join().unwrap();
-    let sizes = complete_rx
-        .try_iter()
-        .filter_map(|r| r.size)
-        .collect::<Vec<_>>(); // We effectively block here.
-    let copied_data = sizes.iter().sum();
-
-    err_thread.join().unwrap();
-    pb.finish_at_current_pos();
-
-    let perm_failed = failed_rx.try_iter().into_iter().collect::<Vec<_>>();
-
-    if !perm_failed.is_empty() {
-        perm_failed
-            .into_iter()
-            .for_each(|f| println!("{:?}", f.error));
-        println!(
-            "Copied {} files of {}, {} of {} in {}",
-            sizes.len(),
-            file_count.load(Ordering::Relaxed),
-            HumanBytes(copied_data),
-            HumanBytes(total_size.load(Ordering::Relaxed)),
-            FormattedDuration(start.elapsed())
-        );
-    } else {
-        println!(
-            "Copied {} files, {} in {}",
-            file_count.load(Ordering::Relaxed),
-            HumanBytes(total_size.load(Ordering::Relaxed)),
-            FormattedDuration(start.elapsed())
-        );
+    State {
+        failed_rx,
+        file_count,
+        total_size,
+        complete_rx,
+        copy_thread,
+        err_thread,
     }
+}
 
-    Ok(())
+fn normalize_input<U: AsRef<Path>, V: AsRef<Path>>(
+    from: &U,
+    to: &V,
+) -> Result<(PathBuf, PathBuf), anyhow::Error> {
+    // let options = MatchOptions {
+    //     case_sensitive: false,
+    //     require_literal_separator: false,
+    //     require_literal_leading_dot: false,
+    // };
+    let src_str = from.as_ref().to_str().unwrap();
+    let source = if is_wildcard_path(src_str) {
+        // glob::glob_with(src_str, options)(|e| {
+        //     expect!("Source used a glob pattern, but the pattern was invalid.");
+        // })
+        bail!("Wildcard source paths are not currently supported.")
+    } else {
+        PathBuf::from(src_str)
+            .dunce_canonicalize()
+            .context("Unable to resolve complete source path.")?
+    };
+    let dst_str = to.as_ref().to_str().unwrap();
+    let dest = if is_wildcard_path(dst_str) {
+        bail!("Wildcard destination paths are not allowed.")
+    } else {
+        let dpath = PathBuf::from(dst_str);
+        fs::create_dir_all(&dpath).context("Unable to resolve complete destination path.")?;
+        dpath
+            .dunce_canonicalize()
+            .context("Unable to resolve complete destination path.")?
+    };
+    if source == dest {
+        bail!("Source and destination paths are the same.");
+    }
+    Ok((source, dest))
 }
 
 fn is_wildcard_path(src_str: &str) -> bool {
@@ -257,7 +281,7 @@ fn process_files<U: AsRef<Path> + Sync, V: AsRef<Path> + Sync>(
             let (failed_tx, complete_tx) = senders;
 
             if scan_result.file.is_some() {
-                let outcome = copy_file(source, dest, &mut scan_result, &pb);
+                let outcome = copy_file(source, dest, &mut scan_result, pb);
                 let err = outcome.err();
                 if err.is_some() {
                     failed_tx.send(scan_result).unwrap();
@@ -295,11 +319,11 @@ fn copy_file<U: AsRef<Path> + Sync, V: AsRef<Path> + Sync>(
         copy_result.metadata = copy_result
             .metadata
             .take()
-            .or(spath.metadata().ok())
-            .and_then(|md| {
+            .or_else(|| spath.metadata().ok())
+            .map(|md| {
                 // If we can get the metadata, set both it and the size fields.
                 copy_result.size = Some(md.len());
-                Some(md)
+                md
             });
     }
 
@@ -311,7 +335,7 @@ fn copy_file<U: AsRef<Path> + Sync, V: AsRef<Path> + Sync>(
             fs::set_permissions(&dpath, permissions)?
         }
     } else {
-        fs::create_dir_all(&dpath.parent().unwrap_or_else(|| &dpath.as_path()))?;
+        fs::create_dir_all(&dpath.parent().unwrap_or_else(|| dpath.as_path()))?;
     }
 
     #[cfg(target_os = "windows")]

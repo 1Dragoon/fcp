@@ -12,7 +12,11 @@
                 "args": [
                     "build",
                     "--bin=fcp",
-                    "--package=fcp"
+                    "--package=fcp",
+                    "--",
+                    "--exoption",
+                    "../../BIM/",
+                    "../purplemonkeydishwasher"
                 ],
                 "filter": {
                     "name": "fcp",

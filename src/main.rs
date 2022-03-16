@@ -1,9 +1,11 @@
+use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use indicatif::{FormattedDuration, HumanBytes, ProgressBar, ProgressStyle};
-use rayon::iter::{Either, IntoParallelIterator, ParallelIterator};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rayon::Scope;
+use shellexpand;
 use std::ffi::{c_void, OsStr};
-use std::fs::{self, DirEntry};
+use std::fs::{self, DirEntry, Metadata};
 use std::io::{Error, ErrorKind};
 use std::os::windows::prelude::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -20,12 +22,22 @@ use windows_sys::Win32::System::WindowsProgramming::*;
 #[clap(name = "fcp", about = "Multi-threaded copy...in rust!")]
 struct Opt {
     /// Source directory
-    source: String,
+    source: PathBuf,
 
     /// Destination directory
-    dest: String,
+    dest: PathBuf,
     // / Allow copying from encrypted location to unencrypted location
     // allow_efs_to_nonefs: bool;
+}
+
+trait PathExt {
+    fn dunce_canonicalize(&self) -> io::Result<PathBuf>;
+}
+
+impl PathExt for Path {
+    fn dunce_canonicalize(&self) -> io::Result<PathBuf> {
+        dunce::canonicalize(&self)
+    }
 }
 
 fn unrolled_find_u16s(needle: u16, haystack: &[u16]) -> Option<usize> {
@@ -72,33 +84,57 @@ fn to_u16s<S: AsRef<OsStr>>(s: S) -> std::io::Result<Vec<u16>> {
     inner(s.as_ref())
 }
 
-fn main() {
+fn main() -> Result<()> {
     let args = Opt::parse();
 
-    let source = PathBuf::from(&args.source)
-        .canonicalize()
-        .unwrap_or_default()
-        .as_os_str()
-        .to_string_lossy()
-        .into_owned();
-    let dest = PathBuf::from(&args.dest)
-        .canonicalize()
-        .unwrap_or_default()
-        .as_os_str()
-        .to_string_lossy()
-        .into_owned();
-    if source == dest {
-        println!("Source and destination are the same.");
-        return;
-    }
+    let src_str = args.source.to_str().context("Source path has non-standard UTF-8. Non-standard UTF-8 paths aren't supported at this time.")?;
+    let dst_str = args.dest.to_str().context("Destination path has non-standard UTF-8. Non-standard UTF-8 paths aren't supported at this time.")?;
 
-    copy(&args.source, &args.dest);
+    let src_arg = shellexpand::full(src_str)
+        .context("Unable to either look up or parse source path.")?
+        .into_owned();
+    let dst_arg = shellexpand::full(dst_str)
+        .context("Unable to either look up or parse destination path.")?
+        .into_owned();
+
+    copy_recurse(&src_arg, &dst_arg)?;
+
+    Ok(())
 }
 
-fn copy<U: AsRef<Path>, V: AsRef<Path>>(from: &U, to: &V) {
+fn copy_recurse<U: AsRef<Path>, V: AsRef<Path>>(from: &U, to: &V) -> Result<()> {
     let start = std::time::Instant::now();
-    let source = PathBuf::from(from.as_ref());
-    let dest = PathBuf::from(to.as_ref());
+
+    // let options = MatchOptions {
+    //     case_sensitive: false,
+    //     require_literal_separator: false,
+    //     require_literal_leading_dot: false,
+    // };
+
+    let src_str = from.as_ref().to_str().unwrap(); // FIXME: Handle OsStr differently whenever https://rust-lang.github.io/rfcs/2295-os-str-pattern.html is approved.
+    let source = if is_wildcard_path(src_str) {
+        // glob::glob_with(src_str, options)(|e| {
+        //     expect!("Source used a glob pattern, but the pattern was invalid.");
+        // })
+        bail!("Wildcard source paths are not currently supported.")
+    } else {
+        PathBuf::from(src_str)
+            .dunce_canonicalize()
+            .context("Unable to resolve complete source path.")?
+    };
+
+    let dst_str = to.as_ref().to_str().unwrap(); // FIXME: Handle OsStr differently whenever https://rust-lang.github.io/rfcs/2295-os-str-pattern.html is approved.
+    let dest = if is_wildcard_path(dst_str) {
+        bail!("Wildcard destination paths are not allowed.")
+    } else {
+        PathBuf::from(dst_str)
+            .dunce_canonicalize()
+            .context("Unable to resolve complete destination path.")?
+    };
+
+    if source == dest {
+        bail!("Source and destination paths are the same.");
+    }
 
     let pb = ProgressBar::new(0);
     pb.set_style(
@@ -109,15 +145,15 @@ fn copy<U: AsRef<Path>, V: AsRef<Path>>(from: &U, to: &V) {
             .progress_chars("#>-")
             // .on_finish(finish)
     );
+    // pb.enable_steady_tick(10);
 
     let (failed_tx, failed_rx) = mpsc::channel();
-    let (size_tx, size_rx) = mpsc::channel();
     let file_count = Arc::new(AtomicUsize::new(0));
     let total_size = AtomicU64::new(0);
+    let scan_finished = Arc::new(AtomicBool::new(false));
+    let (scan_tx, scan_rx) = mpsc::channel();
 
-    {
-        let (scan_tx, scan_rx) = mpsc::channel();
-        let scan_finished = Arc::new(AtomicBool::new(false));
+    let scan_thread = {
         {
             let sf = scan_finished.clone();
             let src = source.clone();
@@ -125,74 +161,102 @@ fn copy<U: AsRef<Path>, V: AsRef<Path>>(from: &U, to: &V) {
             thread::spawn(move || {
                 rayon::scope(|s| scan(scan_pb, &src, scan_tx, s));
                 sf.store(true, Ordering::Relaxed);
-            });
+            })
         }
+    };
 
-        let (err_tx, err_rx) = mpsc::channel();
+    let (copy_tx, copy_rx) = mpsc::channel();
 
-        let copy_finished = Arc::new(AtomicBool::new(false));
-        {
-            let sztx = size_tx.clone();
-            let cp_fin = copy_finished.clone();
-            let cp_pb = pb.clone();
-            let cp_fc = file_count.clone();
-            let cp_src = source.clone();
-            let cp_dst = dest.clone();
-            thread::spawn(move || {
-                loop {
-                    let done = scan_finished.load(Ordering::Relaxed);
-                    thread::sleep(Duration::new(0, 100_000_000)); // Sleep 100ms to give the CPU a coffee break
-                    let received: (Vec<_>, Vec<_>) = scan_rx.try_recv().into_iter().unzip();
-                    let (file_set, _sizes) = received;
-                    if !file_set.is_empty() {
-                        cp_fc.fetch_add(file_set.len(), Ordering::Relaxed);
-                        let output =
-                            process_files(&cp_pb, &cp_src, &cp_dst, file_set, sztx.clone());
-                        err_tx.send(output).unwrap();
-                    }
-                    if done {
-                        break;
+    let copy_finished = Arc::new(AtomicBool::new(false));
+    let copy_thread = {
+        let ftx = failed_tx.clone();
+        let cp_tx = copy_tx.clone();
+        let cp_fin = copy_finished.clone();
+        let cp_pb = pb.clone();
+        let cp_fc = file_count.clone();
+        let cp_src = source.clone();
+        let cp_dst = dest.clone();
+        thread::spawn(move || {
+            loop {
+                let done = scan_finished.load(Ordering::Relaxed);
+                thread::sleep(Duration::new(0, 100_000_000)); // Sleep 100ms to give the CPU a coffee break
+                let scan_results = scan_rx.try_recv().into_iter().collect::<Vec<_>>();
+                let mut scan_err_set = Vec::new();
+                let mut file_set = Vec::new();
+                for scan_result in scan_results {
+                    if scan_result.has_error() {
+                        if scan_result.dir.is_some() {
+                            ftx.send(scan_result).unwrap();
+                        } else {
+                            scan_err_set.push(scan_result)
+                        }
+                    } else {
+                        file_set.push(scan_result);
                     }
                 }
-                cp_fin.store(true, Ordering::Relaxed);
-            });
-        }
+                if !file_set.is_empty() {
+                    cp_fc.fetch_add(file_set.len(), Ordering::Relaxed);
+                    process_files(&cp_pb, &cp_src, &cp_dst, file_set, cp_tx.clone());
+                }
+                scan_err_set.into_iter().for_each(|r| ftx.send(r).unwrap());
+                if done {
+                    break;
+                }
+            }
+            cp_fin.store(true, Ordering::Relaxed);
+        })
+    };
 
-        {
-            let err_pb = pb.clone();
-            thread::spawn(move || {
-                loop {
-                    let done = copy_finished.load(Ordering::Relaxed);
-                    thread::sleep(Duration::new(0, 100_000_000)); // Sleep 100ms to give the CPU a coffee break
-                    let err_out: (Vec<_>, Vec<_>) = err_rx.try_recv().into_iter().unzip();
-                    let (err_set, _) = err_out;
-                    if !err_set.is_empty() {
-                        
-                        let err_set = err_set.into_iter().flatten().collect::<Vec<_>>();
-                        let perm_failed =
-                            process_files(&err_pb, &source, &dest, err_set, size_tx.clone()).1;
-                        failed_tx.send(perm_failed).unwrap();
-                    }
-                    if done {
-                        break;
+    scan_thread.join().unwrap();
+    let err_thread = {
+        let ftx = failed_tx.clone();
+        let err_pb = pb.clone();
+        thread::spawn(move || {
+            loop {
+                let done = copy_finished.load(Ordering::Relaxed);
+                thread::sleep(Duration::new(0, 100_000_000)); // Sleep 100ms to give the CPU a coffee break
+                let copy_results = copy_rx.try_recv().into_iter().collect::<Vec<_>>();
+                let mut scan_err_set = Vec::new();
+                let mut retry_set = Vec::new();
+                for copy_result in copy_results {
+                    if copy_result.has_error() {
+                        if copy_result.dir.is_some() {
+                            ftx.send(copy_result).unwrap();
+                        } else {
+                            scan_err_set.push(copy_result)
+                        }
+                    } else {
+                        retry_set.push(copy_result);
                     }
                 }
-            });
-        }
-    }
 
-    let sizes = size_rx.iter().collect::<Vec<_>>(); // We effectively block here.
+                if !retry_set.is_empty() {
+                    process_files(&err_pb, &source, &dest, retry_set, ftx.clone());
+                }
+                if done {
+                    break;
+                }
+            }
+        })
+    };
+
+    copy_thread.join().unwrap();
+    let sizes = failed_rx
+        .recv()
+        .iter()
+        .map(|r| r.size.unwrap())
+        .collect::<Vec<_>>(); // We effectively block here.
     let copied_data = sizes.iter().sum();
 
+    err_thread.join().unwrap();
     pb.finish_at_current_pos();
 
-    let perm_failed = failed_rx.recv().into_iter().flatten().collect::<Vec<_>>();
+    let perm_failed = failed_rx.recv().into_iter().collect::<Vec<_>>();
 
     if !perm_failed.is_empty() {
         perm_failed
             .into_iter()
-            .map(|f| f.1)
-            .for_each(|f| println!("{}", f));
+            .for_each(|f| println!("{}", f.error.unwrap()));
         println!(
             "Copied {} files of {}, {} of {} in {}",
             sizes.len(),
@@ -209,135 +273,103 @@ fn copy<U: AsRef<Path>, V: AsRef<Path>>(from: &U, to: &V) {
             FormattedDuration(start.elapsed())
         );
     }
+
+    Ok(())
 }
 
-type DirEntryResult = Result<DirEntry, std::io::Error>;
-
-macro_rules! distribute_output {
-    ($dothis:expr, $file:expr, $msg:expr, $err:ident) => {
-        match $dothis {
-            Ok(ref ok) => ok,
-            Err(ref $err) => {
-                let message = $msg;
-                return Either::Right(($file, message));
-            }
-        }
-    };
+fn is_wildcard_path(src_str: &str) -> bool {
+    src_str
+        .chars()
+        .any(|c| -> bool { c == '?' || c == '*' || c == '[' || c == ']' })
 }
 
 fn process_files<U: AsRef<Path> + Sync, V: AsRef<Path> + Sync>(
     pb: &ProgressBar,
     source: &U,
     dest: &V,
-    files: Vec<DirEntryResult>,
-    tx: Sender<u64>,
-) -> (Vec<DirEntryResult>, Vec<(DirEntryResult, String)>) {
-    // Won't ever get used, but it makes the compiler happy
-    let default = PathBuf::from(".");
-
+    files: Vec<ActionResult>,
+    tx: Sender<ActionResult>,
+) {
     files
         .into_par_iter()
-        .map_with(tx, |s, x| (s.clone(), x))
-        .partition_map(|f: (Sender<u64>, DirEntryResult)| {
-            let (tx, file) = f;
-            macro_rules! handleit {
-                ($dothis:expr, $err:ident, $msg:expr) => {
-                    distribute_output!($dothis, file, $msg, $err)
-                };
-            }
-            let entry = handleit!(file, err, format!("Error: {:?}", err.kind()));
-            macro_rules! ioerr {
-                ($step:expr, $err:expr, $err_str:expr) => {
-                    format!(
-                        "{}: {:?} {} for file {}",
-                        $step,
-                        $err,
-                        $err_str,
-                        entry.path().as_os_str().to_string_lossy().into_owned()
-                    )
-                };
-            }
+        .map_with(tx, |sender, result| (sender.clone(), result))
+        .for_each(|f| {
+            let (tx, mut scan_result) = f;
 
-            let spath = entry.path();
-            let s = spath.display().to_string();
-            if let Some((i, _)) = s.char_indices().rev().nth(50) {
-                pb.set_message(s[i..].to_owned());
+            if scan_result.file.is_some() {
+                let outcome = copy_file(source, dest, &mut scan_result, &pb);
+                let err = outcome.err();
+                scan_result.error = err;
+                tx.send(scan_result).unwrap();
+            } else {
+                tx.send(scan_result).unwrap();
             }
-            let strip = spath.strip_prefix(&source);
-            let stem = handleit!(strip, err, ioerr!("Strip Prefix Error", err, ""));
-            let dpath = dest.as_ref().join(&stem);
-            let size = handleit!(
-                entry.metadata(),
-                err,
-                ioerr!(
-                    "Metadata Fetch Error {}",
-                    err.kind(),
-                    err.raw_os_error().unwrap_or_default()
-                )
-            )
-            .len();
-            handleit!(
-                fs::create_dir_all(&dpath.parent().unwrap_or_else(|| default.as_path())),
-                err,
-                ioerr!("Directory Create Error", err.kind(), "")
-            );
-            if dpath.exists() {
-                let dmd = dpath.metadata();
-                let d_metadata = handleit!(
-                    dmd,
-                    err,
-                    ioerr!(
-                        "Metadata Fetch Error",
-                        err.kind(),
-                        err.raw_os_error().unwrap_or_default()
-                    )
-                );
-                let mut permissions = d_metadata.permissions();
-                if permissions.readonly() {
-                    permissions.set_readonly(false);
-                    handleit!(
-                        fs::set_permissions(&dpath, permissions),
-                        err,
-                        ioerr!(
-                            "Error unsetting readonly",
-                            err.kind(),
-                            err.raw_os_error().unwrap_or_default()
-                        )
-                    );
-                }
-            }
+        });
+}
 
-            #[cfg(target_os = "windows")]
-            let copied = *handleit!(
-                win_copy(&spath, &dpath, pb),
-                err,
-                ioerr!(
-                    "Error while copying",
-                    err.kind(),
-                    err.raw_os_error().unwrap_or_default()
-                )
-            );
+fn copy_file<U: AsRef<Path> + Sync, V: AsRef<Path> + Sync>(
+    source: &U,
+    dest: &V,
+    copy_result: &mut ActionResult,
+    pb: &ProgressBar,
+) -> Result<(), anyhow::Error> {
+    let direntry = copy_result.file.take().unwrap();
+    let spathbuf = direntry.path();
+    let spath = spathbuf.as_path();
+    copy_result.file = Some(direntry);
+    let s = spath.display().to_string();
+    if let Some((i, _)) = s.char_indices().rev().nth(50) {
+        pb.set_message(s[i..].to_owned());
+    }
+    let stem = spath.strip_prefix(&source)?;
+    let dpath = dest.as_ref().join(stem);
 
-            #[cfg(not(target_os = "windows"))]
-            {
-                handleit!(
-                    fs::copy(&spath, &dpath),
-                    err,
-                    ioerr!(
-                        "Error while copying",
-                        err.kind(),
-                        err.raw_os_error().unwrap_or_default()
-                    )
-                );
-                pb.inc(size);
-            }
+    // If we don't have the size, make sure we have the metadata. If we don't have the metadata and still can't get it, leave both it and size to None.
+    if copy_result.size.is_none() {
+        copy_result.metadata = copy_result
+            .metadata
+            .take()
+            .or(spath.metadata().ok())
+            .and_then(|md| {
+                // If we can get the metadata, set both it and the size fields.
+                copy_result.size = Some(md.len());
+                Some(md)
+            });
+    }
 
-            if copied != size {
-                println!("Liar!")
-            }
-            tx.send(size).unwrap();
-            Either::Left(file)
-        })
+    if dpath.exists() {
+        let d_metadata = dpath.metadata()?;
+        let mut permissions = d_metadata.permissions();
+        if permissions.readonly() {
+            permissions.set_readonly(false);
+            fs::set_permissions(&dpath, permissions)?
+        }
+    } else {
+        let default = PathBuf::from(".");
+        fs::create_dir_all(&dpath.parent().unwrap_or_else(|| default.as_path()))?;
+    }
+
+    #[cfg(target_os = "windows")]
+    let transferred = win_copy(&spath, &dpath, pb)?;
+    if copy_result.size.is_some() {
+        let size = copy_result.size.unwrap();
+        if size != transferred {
+            println!("Liar!");
+        }
+    } else {
+        copy_result.size = Some(transferred);
+    }
+
+    // #[cfg(not(target_os = "windows"))]
+    {
+        fs::copy(&spath, &dpath)?;
+        if copy_result.size.is_some() {
+            let size = copy_result.size.unwrap();
+            pb.inc(size);
+        }
+    }
+
+    Ok(())
 }
 
 fn win_copy<U: AsRef<Path>, V: AsRef<Path>>(
@@ -391,29 +423,65 @@ fn win_copy<U: AsRef<Path>, V: AsRef<Path>>(
     }
 }
 
-fn scan<'a, U: AsRef<Path>>(
-    pb: ProgressBar,
-    src: &U,
-    tx: Sender<(DirEntryResult, u64)>,
-    scope: &Scope<'a>,
-) {
-    if src.as_ref().is_dir() {
-        let dir = fs::read_dir(src).unwrap();
-        dir.into_iter().for_each(|entry| {
-            let info = entry.as_ref().unwrap();
-            let path = info.path();
+struct ActionResult {
+    error: Option<anyhow::Error>,
+    file: Option<DirEntry>,
+    dir: Option<PathBuf>,
+    metadata: Option<Metadata>,
+    size: Option<u64>,
+}
 
-            if path.is_dir() {
-                let tx = tx.clone();
-                let pb = pb.clone();
-                scope.spawn(move |s| scan(pb, &path, tx, s))
-            } else {
-                // dbg!("{}", path.as_os_str().to_string_lossy());
-                let size = info.metadata().unwrap().len();
-                pb.inc_length(size);
-                tx.send((entry, size)).unwrap();
-            }
-        });
-    } else {
+impl ActionResult {
+    fn has_error(&self) -> bool {
+        self.error.is_some()
+    }
+
+    fn new() -> ActionResult {
+        ActionResult {
+            error: None,
+            file: None,
+            dir: None,
+            metadata: None,
+            size: None,
+        }
+    }
+}
+
+fn scan<'a, U: AsRef<Path>>(pb: ProgressBar, src: &U, tx: Sender<ActionResult>, scope: &Scope<'a>) {
+    match fs::read_dir(src) {
+        Ok(dir) => {
+            dir.into_iter().for_each(|dir_entry_result| {
+                let mut result = ActionResult::new();
+                match dir_entry_result {
+                    Ok(entry) => {
+                        let path = entry.path();
+                        result.file = Some(entry);
+                        if path.is_dir() {
+                            let tx = tx.clone();
+                            let pb = pb.clone();
+                            scope.spawn(move |s| scan(pb, &path, tx, s))
+                        } else {
+                            if let Ok(md) = path.metadata() {
+                                pb.inc_length(md.len());
+                                result.size = Some(md.len());
+                                result.metadata = Some(md);
+                            } else {
+                                result.error = Some(anyhow!("Failed to read metadata"));
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        result.error = Some(anyhow!("Failed to get directory entry"));
+                        tx.send(result).unwrap();
+                    }
+                }
+            });
+        }
+        Err(_) => {
+            let mut result = ActionResult::new();
+            result.error = Some(anyhow!("Failed to read from directory"));
+            result.dir = Some(src.as_ref().to_path_buf());
+            tx.send(result).unwrap();
+        }
     }
 }

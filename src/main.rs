@@ -313,10 +313,12 @@ fn copy_file<U: AsRef<Path> + Sync, V: AsRef<Path> + Sync>(
     copy_result: &mut ActionResult,
     pb: &ProgressBar,
 ) -> Result<(), anyhow::Error> {
+    // Just need to borrow this for a second...
     let direntry = copy_result.file.take().unwrap();
-    let spathbuf = direntry.path();
-    let spath = spathbuf.as_path();
+    let spath = direntry.path();
+    // And let's put it back where we found it... :)
     copy_result.file = Some(direntry);
+
     let s = spath.display().to_string();
     if let Some((i, _)) = s.char_indices().rev().nth(50) {
         pb.set_message(s[i..].to_owned());

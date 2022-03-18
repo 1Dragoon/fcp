@@ -1,12 +1,12 @@
-use std::os::windows::prelude::OsStrExt;
+use indicatif::ProgressBar;
+use std::ffi::c_void;
 use std::ffi::OsStr;
 use std::io::{self, Error, ErrorKind};
-use std::ffi::c_void;
+use std::os::windows::prelude::OsStrExt;
+use std::path::Path;
 use std::ptr;
-use indicatif::ProgressBar;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Storage::FileSystem;
-use std::path::Path;
 
 // use windows_sys::Win32::System::WindowsProgramming::*;
 // need to detect when the OS will support COPY_FILE_REQUEST_COMPRESSED_TRAFFIC
@@ -95,7 +95,7 @@ pub(crate) fn win_copy<U: AsRef<Path>, V: AsRef<Path>>(
             Some(callback),
             ptr::addr_of_mut!(func) as *mut c_void,
             ptr::null_mut(),
-            0 //COPY_FILE_REQUEST_COMPRESSED_TRAFFIC,
+            0, //COPY_FILE_REQUEST_COMPRESSED_TRAFFIC,
         )
     };
     if boolresult != 0 {

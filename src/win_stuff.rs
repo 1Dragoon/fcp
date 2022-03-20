@@ -55,7 +55,7 @@ fn to_u16s<S: AsRef<OsStr>>(s: S) -> std::io::Result<Vec<u16>> {
     inner(s.as_ref())
 }
 
-pub(crate) fn win_copy<U: AsRef<Path>, V: AsRef<Path>>(
+pub(crate) async fn win_copy<U: AsRef<Path>, V: AsRef<Path>>(
     spath: U,
     dpath: V,
     pb: &ProgressBar,

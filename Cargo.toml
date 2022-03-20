@@ -8,11 +8,19 @@ edition = "2021"
 [dependencies]
 rayon = "1.5.1"
 clap = { version = "3.0.14", features = ["derive"] }
-indicatif = "0.16.2"
-windows-sys = {version ="0.33.0", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_WindowsProgramming"]}
+indicatif = { version = "0.17.0-rc.9", features = ["rayon", "improved_unicode"] }
+# indicatif = { version = "0.16.2", features = ["rayon", "improved_unicode"] }
+windows-sys = { version ="0.34.0", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_System_WindowsProgramming"] }
 glob = "0.3.0"
 shellexpand = "2.1.0"
 directories = "4.0.1"
 lazy_static = "1.4.0"
 anyhow = "1.0.56"
 dunce = "1.0.2"
+tokio = { version = "1.17.0", features = ["full"] }
+tokio-util = { version = "0.7.0", features = ["full"] }
+tokio-stream = { version = "0.1.8" }
+tokio-scoped = "0.2.0"
+futures = "0.3.21"
+async-recursion = "1.0.0"
+# tokio_scoped = { version = "*", features = ["full"] }

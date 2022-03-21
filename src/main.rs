@@ -3,6 +3,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use async_recursion::async_recursion;
 use clap::Parser;
+use futures::StreamExt;
 use indicatif::{FormattedDuration, HumanBytes, ProgressBar, ProgressStyle};
 use std::fs::Metadata;
 use std::path::{Path, PathBuf};
@@ -13,6 +14,7 @@ use tokio::io;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 use tokio::time::{self, Duration, Instant};
+use tokio_stream::wrappers::UnboundedReceiverStream;
 
 mod win_stuff;
 
@@ -57,7 +59,6 @@ async fn main() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-#[allow(clippy::option_map_unit_fn)]
 async fn copy_recurse<U: AsRef<Path>, V: AsRef<Path>>(
     source: &U,
     dest: &V,
@@ -93,11 +94,8 @@ async fn copy_recurse<U: AsRef<Path>, V: AsRef<Path>>(
         })
         .collect::<Vec<_>>(); // Block here until complete_tx sender is gone
     let copied_data = successful_copy_sizes.iter().sum();
-    println!("Not here!!!!");
 
-    let perm_failed = state.failed_rx.try_recv().into_iter().collect::<Vec<_>>(); // Block here until the err_thread sender is gone
-
-    println!("Or here!!!!");
+    let perm_failed = UnboundedReceiverStream::from(state.failed_rx).collect::<Vec<_>>().await; // Block here until the err_thread sender is gone
 
     state.copy_task.await.unwrap();
     // state.err_task.await.unwrap();
@@ -114,7 +112,9 @@ async fn copy_recurse<U: AsRef<Path>, V: AsRef<Path>>(
                 JobStatus::PermaFailure(a) => Some(a.error),
             };
 
-            err.map(|e| println!("{:?}", e));
+            if let Some(e) = err {
+                println!("{:?}", e)
+            }
         });
         println!(
             "Copied {} files of {}, {} of {} in {}",
@@ -141,6 +141,7 @@ struct State {
     file_count: Arc<AtomicUsize>,
     total_size: Arc<AtomicU64>,
     complete_rx: UnboundedReceiver<JobStatus>,
+    scan_task: JoinHandle<()>,
     copy_task: JoinHandle<()>,
     // err_thread: JoinHandle<()>,
 }
@@ -155,15 +156,17 @@ async fn work(source: PathBuf, dest: PathBuf, pb: ProgressBar, clock: Arc<Instan
     let sf = scan_finished.clone();
     let src = source.clone();
     let scan_pb = pb.clone();
-    // tokio::spawn(async move {
-    sf.store(true, Ordering::Relaxed);
-    scan(scan_pb, &src, scan_tx, ts).await;
-    // });
+    let sc_tx = scan_tx.clone();
+    let scan_task = tokio::spawn(async move {
+        scan(scan_pb, &src, sc_tx, ts).await;
+        sf.store(true, Ordering::Relaxed);
+    });
     let (complete_tx, complete_rx) = mpsc::unbounded_channel();
     let copy_finished = Arc::new(AtomicBool::new(false));
-    let copy_thread = {
+    let copy_task = {
         let ftx = failed_tx;
         let ctx = complete_tx;
+        let sctx = scan_tx;
         let cp_fin = copy_finished;
         let cp_pb = pb;
         let cp_fc = file_count.clone();
@@ -174,6 +177,7 @@ async fn work(source: PathBuf, dest: PathBuf, pb: ProgressBar, clock: Arc<Instan
                 scan_finished,
                 scan_rx,
                 ftx,
+                sctx,
                 ctx,
                 cp_fc,
                 cp_pb,
@@ -191,7 +195,8 @@ async fn work(source: PathBuf, dest: PathBuf, pb: ProgressBar, clock: Arc<Instan
         file_count,
         total_size,
         complete_rx,
-        copy_task: copy_thread,
+        scan_task,
+        copy_task,
         // err_thread,
     }
 }
@@ -200,6 +205,7 @@ async fn main_work(
     scan_finished: Arc<AtomicBool>,
     mut scan_rx: UnboundedReceiver<JobStatus>,
     failed_tx: UnboundedSender<JobStatus>,
+    scan_tx: UnboundedSender<JobStatus>,
     complete_tx: UnboundedSender<JobStatus>,
     file_count: Arc<AtomicUsize>,
     pb: ProgressBar,
@@ -209,21 +215,41 @@ async fn main_work(
     clock: Arc<Instant>,
 ) {
     let mut op_file_count = 0;
+    let mut empty = 0;
+    let mut done = false;
     loop {
-        let done = scan_finished.load(Ordering::Relaxed);
+        // let mut done = scan_finished.load(Ordering::Relaxed);
         time::sleep(Duration::new(0, 100_000_000)).await; // Sleep 100ms to give the CPU a coffee break
-        while let Some(mut scan_result) = scan_rx.recv().await {
+        let mut jobs = Vec::new();
+        loop {
+            match scan_rx.try_recv() {
+                Ok(job_status) => jobs.push(job_status),
+                Err(err) => match err {
+                    mpsc::error::TryRecvError::Empty => {
+                        break;
+                    }
+                    mpsc::error::TryRecvError::Disconnected => {
+                        done = true;
+                        break;
+                    }
+                },
+            }
+        }
+        if jobs.is_empty() { empty += 1 }
+        if empty > 3 { done = true; }
+        for mut job_status in jobs {
             //.try_iter().into_iter().collect::<Vec<_>>();
-            match scan_result {
-                JobStatus::ScanFailure(_) => failed_tx.send(scan_result).unwrap(),
+            match job_status {
+                JobStatus::ScanFailure(_) => failed_tx.send(job_status).unwrap(),
                 JobStatus::ScanSuccess(_) => {
                     op_file_count += 1;
                     process_file(
                         pb.clone(),
                         &source,
                         &dest,
-                        scan_result,
+                        job_status,
                         failed_tx.clone(),
+                        scan_tx.clone(),
                         complete_tx.clone(),
                         clock.clone(),
                     )
@@ -237,23 +263,24 @@ async fn main_work(
                             meta_data: job.meta_data.take(),
                         }));
                         failed_tx.send(fail).unwrap();
-                    } else if job.retry_at > clock.elapsed().as_secs() {
+                    } else if clock.elapsed().as_secs() >= job.retry_at  {
                         process_file(
                             pb.clone(),
                             &source,
                             &dest,
-                            scan_result,
+                            job_status,
                             failed_tx.clone(),
+                            scan_tx.clone(),
                             complete_tx.clone(),
                             clock.clone(),
                         )
                         .await
                     } else {
-                        complete_tx.send(scan_result).unwrap();
+                        scan_tx.send(job_status).unwrap();
                     }
                 }
-                JobStatus::CopySuccess(_) => complete_tx.send(scan_result).unwrap(),
-                JobStatus::PermaFailure(_) => failed_tx.send(scan_result).unwrap(),
+                JobStatus::CopySuccess(_) => complete_tx.send(job_status).unwrap(),
+                JobStatus::PermaFailure(_) => failed_tx.send(job_status).unwrap(),
             }
         }
         if done {
@@ -314,58 +341,58 @@ async fn process_file<U: AsRef<Path> + Sync, V: AsRef<Path> + Sync>(
     dest: &V,
     file: JobStatus,
     failed_tx: UnboundedSender<JobStatus>,
+    scan_tx: UnboundedSender<JobStatus>,
     complete_tx: UnboundedSender<JobStatus>,
     clock: Arc<Instant>,
 ) {
-    let mut ji = TaskInfo::new();
+    let mut scratch_pad = ScratchPad::new();
 
     let can_process = match file {
         JobStatus::ScanFailure(_) => panic!(), // Shouldn't happen
         JobStatus::ScanSuccess(a) => {
-            ji.attempt = 0;
-            ji.dir_entry = Some(a.dir_entry);
-            ji.error.extend(a.error);
-            ji.metadata = a.meta_data;
+            scratch_pad.attempt = 0;
+            scratch_pad.dir_entry = Some(a.dir_entry);
+            scratch_pad.error.extend(a.error);
+            scratch_pad.metadata = a.meta_data;
             true
         }
         JobStatus::CopyFailure(a) => {
-            ji.attempt = a.try_count;
-            ji.dir_entry = a.dir_entry;
-            ji.error.extend(a.error);
-            ji.metadata = a.meta_data;
+            scratch_pad.attempt = a.try_count;
+            scratch_pad.dir_entry = a.dir_entry;
+            scratch_pad.error.extend(a.error);
+            scratch_pad.metadata = a.meta_data;
             true
         }
         JobStatus::CopySuccess(_) => panic!(), // Shouldn't happen
         JobStatus::PermaFailure(a) => {
-            ji.dir_entry = a.dir_entry;
-            ji.error.extend(a.error);
-            ji.metadata = a.meta_data;
+            scratch_pad.dir_entry = a.dir_entry;
+            scratch_pad.error.extend(a.error);
+            scratch_pad.metadata = a.meta_data;
             false
         }
     };
 
     if can_process {
-        let jobresult = copy_file(source, dest, &mut ji, pb).await;
+        let jobresult = copy_file(source, dest, &mut scratch_pad, pb).await;
         match jobresult {
             Ok(r) => complete_tx.send(r).unwrap(),
             Err(err) => {
                 let error = vec![err];
-                complete_tx
-                    .send(JobStatus::CopyFailure(Box::new(CopyFailure {
-                        error,
-                        dir_entry: ji.dir_entry,
-                        meta_data: ji.metadata,
-                        try_count: ji.attempt + 1,
-                        retry_at: (clock.elapsed() + Duration::from_secs(2)).as_secs(),
-                    })))
-                    .unwrap()
+                let jr = JobStatus::CopyFailure(Box::new(CopyFailure {
+                    error,
+                    dir_entry: scratch_pad.dir_entry,
+                    meta_data: scratch_pad.metadata,
+                    try_count: scratch_pad.attempt + 1,
+                    retry_at: (clock.elapsed() + Duration::from_secs(2)).as_secs(),
+                }));
+                scan_tx.send(jr).unwrap();
             }
         };
     } else {
         let jobresult = JobStatus::PermaFailure(Box::new(PermaFailure {
-            error: ji.error,
-            dir_entry: ji.dir_entry,
-            meta_data: ji.metadata,
+            error: scratch_pad.error,
+            dir_entry: scratch_pad.dir_entry,
+            meta_data: scratch_pad.metadata,
         }));
         failed_tx.send(jobresult).unwrap();
     }
@@ -374,7 +401,7 @@ async fn process_file<U: AsRef<Path> + Sync, V: AsRef<Path> + Sync>(
 async fn copy_file<U: AsRef<Path> + Sync, V: AsRef<Path> + Sync>(
     source: &U,
     dest: &V,
-    process: &mut TaskInfo,
+    process: &mut ScratchPad,
     pb: ProgressBar,
 ) -> Result<JobStatus, anyhow::Error> {
     let spath = process.dir_entry.as_ref().unwrap().path();
@@ -426,7 +453,7 @@ async fn copy_file<U: AsRef<Path> + Sync, V: AsRef<Path> + Sync>(
         process.size = Some(transferred);
     }
 
-    // #[cfg(not(target_os = "windows"))]
+    #[cfg(not(target_os = "windows"))]
     {
         fs::copy(&spath, &dpath)
             .await
@@ -504,7 +531,7 @@ struct ScanFailure {
 }
 
 #[derive(Debug)]
-struct TaskInfo {
+struct ScratchPad {
     error: Vec<anyhow::Error>,
     attempt: u8,
     dir_entry: Option<Box<DirEntry>>,
@@ -514,9 +541,9 @@ struct TaskInfo {
     success: bool,
 }
 
-impl TaskInfo {
-    fn new() -> TaskInfo {
-        TaskInfo {
+impl ScratchPad {
+    fn new() -> ScratchPad {
+        ScratchPad {
             error: Vec::new(),
             attempt: 0,
             dir_entry: None,

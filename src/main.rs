@@ -76,6 +76,8 @@ async fn copy_recurse<U: AsRef<Path>, V: AsRef<Path>>(
 
     let state = work(source, dest, pb.clone(), clock.clone()).await;
 
+    state.scan_task.await.unwrap();
+    state.copy_task.await.unwrap();
     let successful_copy_sizes =
         TokioStreamExt::collect::<Vec<_>>(UnboundedReceiverStream::from(state.complete_rx))
             .await
@@ -94,8 +96,6 @@ async fn copy_recurse<U: AsRef<Path>, V: AsRef<Path>>(
         tokio_stream::StreamExt::collect::<Vec<_>>(UnboundedReceiverStream::from(state.failed_rx))
             .await; // Block here until the err_thread sender is gone
 
-    // state.scan_task.await.unwrap();
-    state.copy_task.await.unwrap();
     // state.err_task.await.unwrap();
     // pb.finish_at_current_pos();
     std::mem::drop(pb);
@@ -139,7 +139,7 @@ struct State {
     file_count: Arc<AtomicUsize>,
     total_size: Arc<AtomicU64>,
     complete_rx: UnboundedReceiver<JobStatus>,
-    // scan_task: JoinHandle<()>,
+    scan_task: JoinHandle<()>,
     copy_task: JoinHandle<()>,
     // err_thread: JoinHandle<()>,
 }
@@ -170,7 +170,7 @@ async fn work(source: Arc<PathBuf>, dest: Arc<PathBuf>, pb: ProgressBar, clock: 
         let cp_fc = file_count.clone();
         let cp_src = source;
         let cp_dst = dest;
-        scan_task.await;
+        // scan_task.await;
         tokio::spawn(async {
             main_work(
                 scan_finished,
@@ -194,7 +194,7 @@ async fn work(source: Arc<PathBuf>, dest: Arc<PathBuf>, pb: ProgressBar, clock: 
         file_count,
         total_size,
         complete_rx,
-        // scan_task,
+        scan_task,
         copy_task,
         // err_thread,
     }

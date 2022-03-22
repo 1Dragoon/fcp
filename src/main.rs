@@ -60,7 +60,7 @@ fn copy_recurse<U: AsRef<Path>, V: AsRef<Path>>(source: &U, dest: &V) -> Result<
     let (source, dest) = normalize_input(source, dest)?;
 
     let pb = ProgressBar::new(0);
-    pb.enable_steady_tick(Duration::from_millis(50));
+    pb.enable_steady_tick(Duration::from_millis(100));
     pb.set_style(
         ProgressStyle::default_bar()
             .template(
@@ -75,9 +75,7 @@ fn copy_recurse<U: AsRef<Path>, V: AsRef<Path>>(source: &U, dest: &V) -> Result<
               (_, 0) => "-".to_string(),
               (pos, secs) => format_args!("{}/s", BinaryBytes(pos/secs)).to_string(),
           })
-            // .on_finish(finish)
     );
-    // pb.enable_steady_tick(10);
 
     let state = work(source, dest, &pb);
 

@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
-use indicatif::{FormattedDuration, HumanBytes, ProgressBar, ProgressStyle};
+use indicatif::{FormattedDuration, HumanBytes, ProgressBar, ProgressStyle, HumanDuration, BinaryBytes};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rayon::Scope;
 use std::fs::{self, DirEntry, Metadata};
@@ -60,13 +60,21 @@ fn copy_recurse<U: AsRef<Path>, V: AsRef<Path>>(source: &U, dest: &V) -> Result<
     let (source, dest) = normalize_input(source, dest)?;
 
     let pb = ProgressBar::new(0);
-    pb.enable_steady_tick(50);
+    pb.enable_steady_tick(Duration::from_millis(50));
     pb.set_style(
         ProgressStyle::default_bar()
             .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:50.cyan/blue}] {bytes}/{total_bytes} {bytes_per_sec} ({eta}) [{msg}]",
-            )
-            .progress_chars("#>-")
+                "{spinner:.green} [{elapsed_precise}] [{bar:50.cyan/blue}] {bytes}/{total_bytes} {my_bytes_sec} ({my_eta}) [{wide_msg:>}]",
+            ).expect("Bad programmer! Bad!")
+            .progress_chars("#>-").with_key("my_eta", |s| 
+            match (s.pos(), s.len()){
+               (0, _) => "-".to_string(),
+               (pos,len) => format!("{:#}", HumanDuration(Duration::from_secs(s.elapsed().as_secs() * (len-pos)/pos))),
+           }).with_key("my_bytes_sec", |s| 
+           match (s.pos(), s.elapsed().as_secs()) {
+              (_, 0) => "-".to_string(),
+              (pos, secs) => format_args!("{}/s", BinaryBytes(pos/secs)).to_string(),
+          })
             // .on_finish(finish)
     );
     // pb.enable_steady_tick(10);
@@ -90,8 +98,7 @@ fn copy_recurse<U: AsRef<Path>, V: AsRef<Path>>(source: &U, dest: &V) -> Result<
 
     state.copy_thread.join().unwrap();
     state.err_thread.join().unwrap();
-    pb.finish_at_current_pos();
-    let _ = pb;
+    pb.finish();
 
     if !perm_failed.is_empty() {
         perm_failed.into_iter().for_each(|r| {
@@ -334,10 +341,7 @@ fn copy_file<U: AsRef<Path> + Sync, V: AsRef<Path> + Sync>(
 ) -> Result<JobResult, anyhow::Error> {
     let spath = process.dir_entry.as_ref().unwrap().path();
 
-    let s = spath.display().to_string();
-    if let Some((i, _)) = s.char_indices().rev().nth(40) {
-        pb.set_message(s[i..].to_owned());
-    }
+    pb.set_message(spath.display().to_string());
     let stem = spath.strip_prefix(&source)?;
     let dpath = dest.as_ref().join(stem);
 

@@ -196,6 +196,7 @@ dependencies = [
  "glob",
  "indicatif",
  "lazy_static",
+ "number_prefix",
  "rayon",
  "shellexpand",
  "windows-sys",
@@ -251,8 +252,8 @@ dependencies = [
 
 [[package]]
 name = "indicatif"
-version = "0.17.0-rc.9"
-source = "git+https://github.com/console-rs/indicatif?branch=align-truncate#798b5cd1155f77f2154968bf22b9493a3e1140c7"
+version = "0.17.0-rc.11"
+source = "git+https://github.com/console-rs/indicatif#1d47e1dbd57bf4013e36bda3eed6a1e9f068a6b6"
 dependencies = [
  "console",
  "number_prefix",

@@ -1,8 +1,12 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
-use indicatif::{FormattedDuration, HumanBytes, ProgressBar, ProgressStyle, HumanDuration, BinaryBytes};
+use indicatif::style::ProgressTracker;
+use indicatif::{FormattedDuration, HumanBytes, ProgressBar, ProgressStyle, BinaryBytes, ProgressState, HumanDuration};
+use number_prefix::NumberPrefix;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rayon::Scope;
+use core::fmt;
+use std::fmt::Write;
 use std::fs::{self, DirEntry, Metadata};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -64,17 +68,15 @@ fn copy_recurse<U: AsRef<Path>, V: AsRef<Path>>(source: &U, dest: &V) -> Result<
     pb.set_style(
         ProgressStyle::default_bar()
             .template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:50.cyan/blue}] {bytes}/{total_bytes} {my_bytes_sec} ({my_eta}) [{wide_msg:>}]",
+                "{spinner:.green} [{elapsed_precise}] [{bar:50.cyan/blue}] {bytes}/{total_bytes} {binary_bytes_per_sec} ({my_eta}) [{wide_msg:>}]",
             ).expect("Bad programmer! Bad!")
-            .progress_chars("#>-").with_key("my_eta", |s| 
+            .progress_chars("#>-").with_key("my_eta", |s: &ProgressState, w: &mut dyn Write| 
             match (s.pos(), s.len()){
-               (0, _) => "-".to_string(),
-               (pos,len) => format!("{:#}", HumanDuration(Duration::from_secs(s.elapsed().as_secs() * (len-pos)/pos))),
-           }).with_key("my_bytes_sec", |s| 
-           match (s.pos(), s.elapsed().as_secs()) {
-              (_, 0) => "-".to_string(),
-              (pos, secs) => format_args!("{}/s", BinaryBytes(pos/secs)).to_string(),
-          })
+               (0, _) => write!(w, "-").unwrap(),
+               (pos,len) => write!(w, "{:#}", HumanDuration(Duration::from_secs(s.elapsed().as_secs() * (len.unwrap_or_default()-pos)/pos))).unwrap(),
+           })
+           .with_key("binary_bytes_per_sec", MyFormatter::new(3, Duration::from_millis(500)))
+
     );
 
     let state = work(source, dest, &pb);
@@ -128,6 +130,145 @@ fn copy_recurse<U: AsRef<Path>, V: AsRef<Path>>(source: &U, dest: &V) -> Result<
     }
 
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct MyFormatter {
+    // These provide functionality for the replacement estimator. We completely ignore the built-in one.
+    samples: Box<[f64]>, // Variable sized circular buffer that holds previous rate samples
+    prev_sample: (u64, Instant), // The previous state for computing the current rate
+    sample_pos: usize,   // The current position in the circular buffer
+    size: usize,         // The size of the circular buffer
+    interval_period: Duration, // The period over which to calculate the rate
+    full: bool,          // Whether the circular buffer is full
+    rate: f64,           // The current rate calculated over the user defined period
+
+    // These provide functionality for determining whether to override the SI scale
+    prev_scale: u8,             // The previous scale of the rate
+    downscale_backoff: Instant, // When to start downscaling
+    force_upscale: bool,        // Whether to force an upscaling
+
+                                // // These are only needed for calculating ETA time because Display doesn't have access to `ProgressState`
+                                // bar_pos: u64, // The current position in the progress bar, needs to be stored for display to access it.
+                                // bar_len: u64, // The length of the progress bar
+}
+
+/// Calculates rate of change of pos over last n samples. The more samples specified, the more data points needed, and the more memory needed.
+impl MyFormatter {
+    fn new(interval_count: usize, interval_period: Duration) -> Self {
+        let mut size = interval_count;
+        if size == 0 {
+            // If the user screws up this is still safe and the cost is trivial
+            size += 1;
+        }
+        Self {
+            prev_scale: 0,
+            downscale_backoff: Instant::now(),
+            force_upscale: false,
+            rate: 0.0,
+            samples: vec![0.0; size].into_boxed_slice(),
+            prev_sample: (0, Instant::now()),
+            sample_pos: 0,
+            interval_period,
+            size,
+            full: false,
+        }
+    }
+
+    const fn len(&self) -> usize {
+        if self.full {
+            self.size
+        } else {
+            self.sample_pos
+        }
+    }
+
+    // Acts as a substitute for the built in estimator. This one allows user defined sampling for smoother display.
+    fn estimator(&mut self, state: &ProgressState, inst: Instant) {
+        let (prev_pos, prev_instant) = &self.prev_sample;
+        let delta = state.pos().saturating_sub(*prev_pos);
+        if delta == 0 || inst <= *prev_instant {
+            return; // No change in position, or time has not advanced since last checking
+        }
+        let elapsed = inst - *prev_instant;
+        if elapsed < self.interval_period {
+            return; // Only record a new sample after the user defined interval has passed
+        }
+        self.sample_pos = (self.sample_pos + 1) % self.size;
+        self.samples[self.sample_pos] = delta as f64 / elapsed.as_secs_f64();
+        self.prev_sample = (state.pos(), inst);
+        let rates = self.samples.iter().sum::<f64>(); // Everything we haven't yet written to will just be zero.
+        if !self.full && self.sample_pos == 0 {
+            self.full = true;
+        }
+        self.rate = rates / self.len() as f64;
+    }
+
+    // Prevents the SI scale from changing back and forth too quickly by adding a backoff period when it does change.
+    // For example, if the rate slows to 999KiB/s, it display as 0.99MiB/s, holding off a unit downscale for at least 3 seconds.
+    fn si_scale_override(&mut self, inst: Instant) {
+        let mut rate = self.rate as u64;
+        let prev_scale = self.prev_scale;
+        let mut prefix = 0_u8;
+        while rate >= 1024 && prefix < 8 {
+            rate /= 1024;
+            prefix += 1;
+        }
+        if prefix < prev_scale || rate > 999 {
+            self.downscale_backoff = inst;
+            self.force_upscale = true;
+        }
+        let backoff_exceeded = if inst.gt(&self.downscale_backoff) {
+            inst - self.downscale_backoff > Duration::from_secs(3)
+        } else {
+            false
+        };
+        if (prefix > prev_scale || backoff_exceeded) && rate < 1000 {
+            self.force_upscale = false;
+        }
+        self.prev_scale = prefix;
+    }
+}
+
+impl ProgressTracker for MyFormatter {
+    fn clone_box(&self) -> std::boxed::Box<(dyn ProgressTracker + 'static)> {
+        Box::new(self.clone())
+    }
+
+    fn tick(&mut self, state: &ProgressState, inst: Instant) {
+        self.estimator(state, inst);
+        self.si_scale_override(inst);
+    }
+
+    fn reset(&mut self, state: &ProgressState, now: Instant) {
+        self.prev_scale = 0;
+        self.downscale_backoff = now;
+        self.force_upscale = false;
+        self.samples = vec![0.0; self.size].into_boxed_slice();
+        self.prev_sample = (state.pos(), now);
+        self.samples[0] = self.rate;
+        self.sample_pos = 0;
+        self.rate = 0.0;
+        self.full = false;
+    }
+
+    fn write(&self, state: &ProgressState, w: &mut dyn fmt::Write) {
+        let eta = format!(
+            "{:.1}s",
+            ((state.len().unwrap_or_default().saturating_sub(state.pos())) as f64 / self.rate)
+        );
+        if self.force_upscale {
+            let rate = self.rate * 1024.0;
+            match NumberPrefix::binary(rate) {
+                NumberPrefix::Standalone(number) => write!(w, "{:.0}B/s {}", number / 1024.0, eta).unwrap(),
+                NumberPrefix::Prefixed(prefix, number) => {
+                    write!(w, "{:.2} {}B/s", number / 1024.0, prefix).unwrap();
+                }
+            }
+        } else {
+            write!(w, "{}/s {}", BinaryBytes(self.rate as u64), eta).unwrap();
+        }
+    }
 }
 
 struct State {
@@ -368,7 +509,7 @@ fn copy_file<U: AsRef<Path> + Sync, V: AsRef<Path> + Sync>(
             fs::set_permissions(&dpath, permissions)?
         }
     } else {
-        fs::create_dir_all(&dpath.parent().unwrap_or_else(|| dpath.as_path()))?;
+        fs::create_dir_all(&dpath.parent().unwrap_or(dpath.as_path()))?;
     }
 
     #[cfg(target_os = "windows")]
